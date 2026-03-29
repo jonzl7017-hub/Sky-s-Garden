@@ -361,7 +361,9 @@
 
 <script>
 // ══════════════════════════════════════════
-//  Sky's Garden — App Logic v2
+//  Sky's Garden — App Logic v3
+//  Storage: localStorage for plant data (always saves)
+//           IndexedDB for photos (much larger capacity)
 // ══════════════════════════════════════════
 
 let collection = [];
@@ -372,6 +374,7 @@ let facingMode = "environment";
 let isIdentifying = false;
 let pendingDeleteIndex = -1;
 let lastPhotoDataUrl = null;
+let photoDB = null; // IndexedDB reference
 
 const XP_PER_PLANT = 25;
 const BADGES = [
@@ -392,9 +395,111 @@ function getLevel(xp) {
   return { level: 6, title: "Nature Champion", prev: 2000, next: null };
 }
 
-function saveData() { try { localStorage.setItem("skys-garden", JSON.stringify({ collection, xp })); } catch {} }
-function loadData() { try { const d = JSON.parse(localStorage.getItem("skys-garden")); if (d) { collection = d.collection || []; xp = d.xp || 0; } } catch {} }
+// ══════════════════════════════════════
+//  IndexedDB — Photo Storage (persistent, large capacity)
+// ══════════════════════════════════════
+function openPhotoDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("SkysGardenPhotos", 1);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("photos")) {
+        db.createObjectStore("photos", { keyPath: "id" });
+      }
+    };
+    request.onsuccess = (e) => { photoDB = e.target.result; resolve(photoDB); };
+    request.onerror = () => { console.warn("IndexedDB not available"); resolve(null); };
+  });
+}
 
+async function savePhoto(plantId, imageDataUrl) {
+  if (!photoDB) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = photoDB.transaction("photos", "readwrite");
+      tx.objectStore("photos").put({ id: plantId, image: imageDataUrl });
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => { console.warn("Photo save failed"); resolve(false); };
+    } catch { resolve(false); }
+  });
+}
+
+async function getPhoto(plantId) {
+  if (!photoDB) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = photoDB.transaction("photos", "readonly");
+      const req = tx.objectStore("photos").get(plantId);
+      req.onsuccess = () => resolve(req.result ? req.result.image : null);
+      req.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+
+async function deletePhoto(plantId) {
+  if (!photoDB) return;
+  return new Promise((resolve) => {
+    try {
+      const tx = photoDB.transaction("photos", "readwrite");
+      tx.objectStore("photos").delete(plantId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch { resolve(); }
+  });
+}
+
+async function clearAllPhotos() {
+  if (!photoDB) return;
+  return new Promise((resolve) => {
+    try {
+      const tx = photoDB.transaction("photos", "readwrite");
+      tx.objectStore("photos").clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch { resolve(); }
+  });
+}
+
+// Generate a unique ID for each plant based on name + date
+function plantId(plant) {
+  return (plant.name + "_" + plant.date).toLowerCase().replace(/[^a-z0-9]/g, "_");
+}
+
+// ══════════════════════════════════════
+//  localStorage — Plant data (names, facts, XP — always saves)
+// ══════════════════════════════════════
+function saveData() {
+  try {
+    // Save collection WITHOUT image data (just text info)
+    const lightCollection = collection.map(p => {
+      const copy = { ...p };
+      delete copy.image; // Don't save base64 images in localStorage
+      return copy;
+    });
+    localStorage.setItem("skys-garden", JSON.stringify({ collection: lightCollection, xp }));
+  } catch (e) {
+    console.warn("localStorage save failed:", e);
+  }
+}
+
+function loadData() {
+  try {
+    const d = JSON.parse(localStorage.getItem("skys-garden"));
+    if (d) { collection = d.collection || []; xp = d.xp || 0; }
+  } catch {}
+}
+
+// Load photos from IndexedDB into collection items for display
+async function loadPhotosIntoCollection() {
+  for (let i = 0; i < collection.length; i++) {
+    const photo = await getPhoto(plantId(collection[i]));
+    if (photo) collection[i].image = photo;
+  }
+}
+
+// ══════════════════════════════════════
+//  Background
+// ══════════════════════════════════════
 function initBackground() {
   const flowers = ["🌸","🌺","🌷","🌹","🌻","💐","🌼","🪻","🌿","🍀","🪷","🌾","💮","🏵️","🌱"];
   const cont = document.getElementById("floatingFlowers");
@@ -467,11 +572,11 @@ function takePhoto() {
   const v = document.getElementById("cameraVideo"), c = document.getElementById("cameraCanvas");
   c.width = v.videoWidth; c.height = v.videoHeight;
   c.getContext("2d").drawImage(v, 0, 0);
-  const dataUrl = c.toDataURL("image/jpeg", 0.8);
+  const dataUrl = c.toDataURL("image/jpeg", 0.7);
   identifyPlant(dataUrl);
 }
 
-// ── Plant Identification (now returns multiple options) ──
+// ── Plant Identification ──
 async function identifyPlant(imageDataUrl) {
   isIdentifying = true;
   lastPhotoDataUrl = imageDataUrl;
@@ -504,10 +609,9 @@ async function identifyPlant(imageDataUrl) {
     if (parsed.options && parsed.options.length > 0) {
       renderOptions(parsed.options, imageDataUrl);
     } else {
-      // Fallback for old format
       const dateStr = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
       const fullPlant = { ...parsed, image: imageDataUrl, date: dateStr };
-      selectPlant(fullPlant);
+      await selectPlant(fullPlant);
     }
     showScreen("result");
   } catch (err) {
@@ -563,34 +667,35 @@ function renderOptions(options, imageDataUrl) {
 
   html += `<button class="primary-btn" onclick="showScreen('camera')" style="background:#e0e0e0;color:#616161;box-shadow:none">None of these — retake photo</button>`;
 
-  // Store options globally so pickOption can access them
   window._currentOptions = options;
   window._currentImageUrl = imageDataUrl;
 
   document.getElementById("resultContent").innerHTML = html;
 }
 
-function pickOption(index) {
+async function pickOption(index) {
   const opt = window._currentOptions[index];
   const imageDataUrl = window._currentImageUrl;
   const dateStr = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-
-  const fullPlant = {
-    ...opt,
-    image: imageDataUrl,
-    date: dateStr
-  };
-
-  selectPlant(fullPlant);
+  const fullPlant = { ...opt, image: imageDataUrl, date: dateStr };
+  await selectPlant(fullPlant);
 }
 
-function selectPlant(plant) {
+async function selectPlant(plant) {
   const alreadyFound = collection.some(p => p.name.toLowerCase() === plant.name.toLowerCase());
 
   if (!alreadyFound) {
     collection.unshift(plant);
     xp += XP_PER_PLANT;
+
+    // Save plant data (without photo) to localStorage — always works
     saveData();
+
+    // Save photo separately to IndexedDB — large capacity, persistent
+    if (plant.image) {
+      await savePhoto(plantId(plant), plant.image);
+    }
+
     updateHeader();
   }
 
@@ -631,7 +736,9 @@ function confirmDelete(index, event) {
   const plant = collection[index];
   document.getElementById("deleteModalText").textContent = `Remove "${plant.name}" from your collection?`;
   document.getElementById("deleteModal").classList.remove("hidden");
-  document.getElementById("deleteConfirmBtn").onclick = function() {
+  document.getElementById("deleteConfirmBtn").onclick = async function() {
+    const plant = collection[pendingDeleteIndex];
+    await deletePhoto(plantId(plant)); // Remove photo from IndexedDB
     collection.splice(pendingDeleteIndex, 1);
     xp = Math.max(0, xp - XP_PER_PLANT);
     saveData();
@@ -657,7 +764,7 @@ function renderCollection(selectedPlant) {
       <button class="back-btn" onclick="renderCollection()">← Back to collection</button>
       <div class="result-wrap">
         <div class="plant-card">
-          ${selectedPlant.image ? `<img src="${selectedPlant.image}" alt="${selectedPlant.name}" />` : ""}
+          ${selectedPlant.image ? `<img src="${selectedPlant.image}" alt="${selectedPlant.name}" />` : `<div style="width:100%;height:200px;background:linear-gradient(135deg,var(--bg1),var(--bg2));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:64px;margin-bottom:16px">${selectedPlant.emoji}</div>`}
           <div class="plant-name">${selectedPlant.emoji} ${selectedPlant.name}</div>
           ${selectedPlant.scientificName ? `<div class="plant-sci">${selectedPlant.scientificName}</div>` : ""}
           <div class="plant-desc">${selectedPlant.description}</div>
@@ -720,10 +827,24 @@ function renderProfile() {
 function showResetConfirm() {
   document.getElementById("resetArea").innerHTML = `<div class="reset-confirm"><div class="reset-text">Are you sure? This will delete all your plants and XP!</div><div class="reset-actions"><button class="btn-danger" onclick="resetGarden()">Yes, reset</button><button class="btn-cancel" onclick="renderProfile()">Cancel</button></div></div>`;
 }
-function resetGarden() { collection = []; xp = 0; saveData(); updateHeader(); showScreen("camera"); }
+async function resetGarden() {
+  collection = []; xp = 0;
+  saveData();
+  await clearAllPhotos();
+  updateHeader();
+  showScreen("camera");
+}
 
 // ── Init ──
-loadData(); updateHeader(); initBackground(); startCamera();
+async function init() {
+  await openPhotoDB();        // Open IndexedDB for photos
+  loadData();                 // Load plant data from localStorage
+  await loadPhotosIntoCollection(); // Attach photos from IndexedDB
+  updateHeader();
+  initBackground();
+  startCamera();
+}
+init();
 </script>
 </body>
 </html>
