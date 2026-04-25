@@ -74,7 +74,7 @@ If you cannot identify a plant at all in the image, respond with:
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: requestBody.model || "claude-sonnet-4-20250514",
+        model: requestBody.model || "claude-sonnet-4-6",
         max_tokens: requestBody.max_tokens || 1500,
         system: systemPrompt,
         messages: requestBody.messages,
